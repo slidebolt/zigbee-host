@@ -1,0 +1,28 @@
+{
+  "name": "@slidebolt/zigbee-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone Zigbee coordinator service for Slidebolt and other local clients",
+  "type": "module",
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "host": "node dist/host.js",
+    "start": "node dist/host.js",
+    "dev": "tsx src/host.ts",
+    "test": "npm run build && node --test dist/**/*.test.js",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@serialport/bindings-cpp": "^13.0.1",
+    "zigbee-herdsman": "10.7.0",
+    "zigbee-herdsman-converters": "26.86.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.0",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=20.15.0"
+  }
+}
