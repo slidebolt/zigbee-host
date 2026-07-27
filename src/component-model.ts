@@ -97,6 +97,29 @@ export function normalizeDevice(device: DeviceInfo, state: Record<string, unknow
   };
 }
 
+function acceptsStateProperty(component: HostComponent, sourceProperty: string, canonical: string, value: unknown): boolean {
+  if (!component.features[canonical]) return false;
+  if (component.kind === "light") return ["state", "brightness", "color_temp", "color_temp_startup", "color", "x", "y", "effect"].includes(sourceProperty);
+  if (component.kind === "sensor") {
+    if (sourceProperty === "state" || sourceProperty === "color") return false;
+    if (["power", "energy"].includes(sourceProperty)) return typeof value === "number";
+    return typeof value !== "boolean";
+  }
+  if (component.kind === "binary_sensor") return sourceProperty !== "state" || canonical !== "power";
+  return true;
+}
+
+export function statePatchForComponent(component: HostComponent, payload: Record<string, unknown>): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  for (const [property, value] of Object.entries(payload)) {
+    const endpointSuffix = component.endpoint ? `_${component.endpoint}` : "";
+    const sourceProperty = endpointSuffix && property.endsWith(endpointSuffix) ? property.slice(0, -endpointSuffix.length) : property;
+    const canonical = canonicalProperty(sourceProperty, component.kind);
+    if (acceptsStateProperty(component, sourceProperty, canonical, value)) patch[canonical] = value;
+  }
+  return patch;
+}
+
 export function commandValues(component: HostComponent, action: string, parameters: Record<string, unknown>): Record<string, unknown> {
   const writable = (name: string): void => {
     if (!component.features[name]?.write) throw new Error(`Component ${component.id} does not support ${name}`);
@@ -108,6 +131,7 @@ export function commandValues(component: HostComponent, action: string, paramete
     if (!name) throw new Error(`Component ${component.id} has no writable binary value`);
     const values = component.features[name]?.values ?? [];
     const stringValues = values.filter((value): value is string => typeof value === "string");
+    if (component.kind === "light" && name === "power" && stringValues.length === 0) return {name, on: "ON", off: "OFF"};
     const on = stringValues.find((value) => ["on", "open", "true", "lock", "locked"].includes(value.toLowerCase())) ?? true;
     const off = stringValues.find((value) => ["off", "close", "closed", "false", "unlock", "unlocked"].includes(value.toLowerCase())) ?? false;
     return {name, on, off};

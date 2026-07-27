@@ -14,7 +14,7 @@ import type {LocatedAdapter} from "./adapter-locator.js";
 import {ZigbeeOperationError} from "./zigbee-service.js";
 import type {ManagedZigbeeRuntime} from "./runtime-manager.js";
 import type {ApiDevice, ApiDeviceSummary, DeviceCapability, DeviceInfo, ProbeResult} from "./types.js";
-import {canonicalProperty, commandValues, normalizeDevice} from "./component-model.js";
+import {commandValues, normalizeDevice, statePatchForComponent} from "./component-model.js";
 
 interface Operation {
   id: string;
@@ -240,13 +240,7 @@ export class ZigbeeHost {
       const state = record.state && typeof record.state === "object" ? record.state as Record<string, unknown> : {};
       const normalized = normalizeDevice(device, state);
       for (const component of normalized.components) {
-        const patch: Record<string, unknown> = {};
-        for (const [property, value] of Object.entries(payload)) {
-          const endpointSuffix = component.endpoint ? `_${component.endpoint}` : "";
-          const sourceProperty = endpointSuffix && property.endsWith(endpointSuffix) ? property.slice(0, -endpointSuffix.length) : property;
-          const canonical = canonicalProperty(sourceProperty, component.kind);
-          if (component.features[canonical]) patch[canonical] = value;
-        }
+        const patch = statePatchForComponent(component, payload);
         if (Object.keys(patch).length > 0) this.#hub?.emit("component.state_changed", {deviceId, componentId: component.id, revision: Date.now(), patch, origin: record.origin}, requestId, "device");
       }
       return;

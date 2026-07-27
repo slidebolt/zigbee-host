@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import {unlinkSync} from "node:fs";
-import {readFile, unlink, writeFile} from "node:fs/promises";
+import {unlink} from "node:fs/promises";
 import process from "node:process";
 import {configureLibraryLogging} from "./logging.js";
 import {ensureHostToken, hostPaths} from "./host-config.js";
@@ -9,27 +9,7 @@ import {probePort} from "./probe.js";
 import {AdapterLocator} from "./adapter-locator.js";
 import {runtimePaths} from "./config.js";
 import {ZigbeeRuntimeManager} from "./runtime-manager.js";
-
-async function processExists(pid: number): Promise<boolean> {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function acquireLock(lock: string): Promise<void> {
-  try {
-    await writeFile(lock, `${process.pid}\n`, {encoding: "utf8", flag: "wx"});
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const existing = Number((await readFile(lock, "utf8")).trim());
-    if (Number.isInteger(existing) && await processExists(existing)) throw new Error(`Zigbee host is already running as PID ${existing}`);
-    await unlink(lock);
-    await writeFile(lock, `${process.pid}\n`, {encoding: "utf8", flag: "wx"});
-  }
-}
+import {acquireLock} from "./host-lock.js";
 
 async function main(): Promise<void> {
   configureLibraryLogging();
