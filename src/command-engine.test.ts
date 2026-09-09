@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import {mkdtemp, rm} from "node:fs/promises";
+import {mkdtemp, readFile, rm} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,6 +26,7 @@ class FakePort implements CommandDevicePort {
   readValue: unknown = FOLLOW_REQUEST;
   staleAfterSet?: unknown;
   lastRequested?: unknown;
+  gets = 0;
   sideEffects: Record<string, unknown> = {};
   readonly values: Record<string, unknown> = {};
 
@@ -40,6 +41,7 @@ class FakePort implements CommandDevicePort {
     return {state: {}, expected: {[property]: value, ...this.sideEffects}};
   }
   async get(_deviceId: string, property: string) {
+    this.gets++;
     const value = property === "brightness" && this.readValue !== FOLLOW_REQUEST ? this.readValue : this.values[property] ?? this.lastRequested;
     this.publish(property, value, "read-response");
     return {[property]: value};
@@ -103,7 +105,7 @@ test("commands for one device execute in FIFO order", async () => {
   }
 });
 
-test("converter-implied side effects are recorded and physically confirmed", async () => {
+test("converter-implied side effects are recorded without blocking physical confirmation", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "zigbee-command-effects-"));
   try {
     const port = new FakePort();
@@ -114,7 +116,43 @@ test("converter-implied side effects are recorded and physically confirmed", asy
     const result = await terminal(engine, queued.id, 4_000);
     assert.equal(result.status, "confirmed");
     assert.deepEqual(result.expected, {brightness: 12, state: "ON"});
-    assert.equal(result.results.state?.observed, "ON");
+    assert.equal(result.results.brightness?.status, "confirmed");
+    assert.equal(result.results.state?.status, "unverifiable");
+    assert.equal(result.results.state?.expected, "ON");
+    assert.match(result.results.state?.detail ?? "", /critical path/);
+    assert.ok(result.timeline?.["effect.state.skipped"]);
+  } finally {
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test("command lifecycle output includes pending, physical send, and observation phases", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "zigbee-command-lifecycle-"));
+  try {
+    const port = new FakePort();
+    const events: string[] = [];
+    const engine = new DeviceCommandEngine({port, storeFile: path.join(root, "commands.json"), output: (event) => events.push(event)});
+    await engine.start();
+    const queued = await engine.submit(ieeeAddress, {brightness: 44}, 1_000);
+    assert.equal((await terminal(engine, queued.id)).status, "confirmed");
+    assert.ok(events.includes("command.pending_marked"));
+    assert.ok(events.includes("command.queued"));
+    assert.ok(events.includes("command.sending"));
+    assert.ok(events.includes("command.physical_send.start"));
+    assert.ok(events.includes("command.physical_send.done"));
+    assert.ok(events.includes("command.observing"));
+    assert.ok(events.includes("command.observe.brightness.start"));
+    assert.ok(events.includes("command.observe.brightness.wait.0.start"));
+    assert.ok(events.includes("command.observe.brightness.read.0.start"));
+    assert.ok(events.includes("command.observe.brightness.read.0.done"));
+    assert.ok(events.includes("command.observe.brightness.matched"));
+    assert.ok(events.includes("command.confirmed"));
+    const result = await terminal(engine, queued.id);
+    assert.ok(result.timeline?.["observe.brightness.start"]);
+    assert.ok(result.timeline?.["observe.brightness.wait.0.start"]);
+    assert.ok(result.timeline?.["observe.brightness.read.0.start"]);
+    assert.ok(result.timeline?.["observe.brightness.read.0.done"]);
+    assert.ok(result.timeline?.["observe.brightness.matched"]);
   } finally {
     await rm(root, {recursive: true, force: true});
   }
@@ -131,6 +169,23 @@ test("write-only properties finish as unverifiable without pretending optimistic
     const result = await terminal(engine, queued.id);
     assert.equal(result.status, "unverifiable");
     assert.equal(result.results.brightness?.status, "unverifiable");
+  } finally {
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test("passive observation waits for reports without issuing active reads", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "zigbee-command-passive-"));
+  try {
+    const port = new FakePort();
+    const engine = new DeviceCommandEngine({port, storeFile: path.join(root, "commands.json")});
+    await engine.start();
+    const queued = await engine.submit(ieeeAddress, {brightness: 70}, 1_000, undefined, "passive");
+    const result = await terminal(engine, queued.id);
+    assert.equal(result.status, "inconclusive");
+    assert.equal(port.gets, 0);
+    assert.equal(result.timeline?.["observe.brightness.read.0.start"], undefined);
+    assert.equal(result.observationMode, "passive");
   } finally {
     await rm(root, {recursive: true, force: true});
   }
@@ -161,6 +216,46 @@ test("terminal command history is pruned after the retention window", async () =
     const old = new Date(Date.now() - 10_000).toISOString();
     await store.put({id: "cmd_old", deviceId: ieeeAddress, status: "confirmed", requested: {}, results: {}, observationTimeoutMs: 1_000, createdAt: old, updatedAt: old, completedAt: old});
     assert.equal(store.get("cmd_old"), undefined);
+  } finally {
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test("terminal command history is capped to the newest commands", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "zigbee-command-cap-"));
+  try {
+    const file = path.join(root, "commands.json");
+    const store = new CommandStore(file, 7 * 24 * 60 * 60 * 1000, 3);
+    const base = Date.now();
+    for (let i = 0; i < 5; i++) {
+      const completedAt = new Date(base + i).toISOString();
+      await store.put({id: `cmd_${i}`, deviceId: ieeeAddress, status: "confirmed", requested: {}, results: {}, observationTimeoutMs: 1_000, createdAt: completedAt, updatedAt: completedAt, completedAt});
+    }
+    assert.equal(store.get("cmd_0"), undefined);
+    assert.equal(store.get("cmd_1"), undefined);
+    assert.deepEqual(store.list({limit: 10}).map((command) => command.id), ["cmd_4", "cmd_3", "cmd_2"]);
+    const saved = JSON.parse(await readFile(file, "utf8")) as {commands: DeviceCommand[]};
+    assert.deepEqual(saved.commands.map((command) => command.id), ["cmd_2", "cmd_3", "cmd_4"]);
+  } finally {
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test("terminal command history cap preserves active commands", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "zigbee-command-cap-active-"));
+  try {
+    const store = new CommandStore(path.join(root, "commands.json"), 7 * 24 * 60 * 60 * 1000, 1);
+    const base = Date.now();
+    for (let i = 0; i < 3; i++) {
+      const completedAt = new Date(base + i).toISOString();
+      await store.put({id: `cmd_terminal_${i}`, deviceId: ieeeAddress, status: "confirmed", requested: {}, results: {}, observationTimeoutMs: 1_000, createdAt: completedAt, updatedAt: completedAt, completedAt});
+    }
+    const activeAt = new Date(base - 60_000).toISOString();
+    await store.put({id: "cmd_active", deviceId: ieeeAddress, status: "observing", requested: {brightness: 40}, results: {}, observationTimeoutMs: 30_000, createdAt: activeAt, updatedAt: activeAt});
+    assert.equal(store.get("cmd_terminal_0"), undefined);
+    assert.equal(store.get("cmd_terminal_1"), undefined);
+    assert.equal(store.get("cmd_terminal_2")?.status, "confirmed");
+    assert.equal(store.get("cmd_active")?.status, "observing");
   } finally {
     await rm(root, {recursive: true, force: true});
   }

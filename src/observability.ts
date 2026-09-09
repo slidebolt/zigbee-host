@@ -2,6 +2,7 @@ import {createWriteStream, type WriteStream} from "node:fs";
 import {mkdir} from "node:fs/promises";
 import path from "node:path";
 import {randomUUID} from "node:crypto";
+import {parseDiagnosticLogOptions, ZigbeeDiagnosticEventWriter, type DiagnosticLogOptions} from "./diagnostics.js";
 
 export type EventCategory = "connection" | "device" | "command" | "progress" | "host";
 
@@ -29,6 +30,7 @@ export function inferCategory(type: string): EventCategory {
   if (type.startsWith("command") || type.startsWith("get_") || type.startsWith("set_")) return "command";
   if (type.includes("progress") || type.includes("heartbeat") || type.startsWith("wait_")) return "progress";
   if (type.startsWith("device") || type === "state") return "device";
+  if (type.startsWith("zigbee_diag.")) return "progress";
   if (type.startsWith("host") || type.startsWith("http")) return "host";
   return "connection";
 }
@@ -46,6 +48,21 @@ export function renderNarrative(event: HostEvent): string[] {
   const prefix = `[${time(event.timestamp)}]`;
   const request = event.requestId ? ` [${event.requestId}]` : "";
   const line = (level: string, message: string): string => `${prefix} [${level.padEnd(5)}]${request} ${message}`;
+  if (event.type.startsWith("command.observe.")) {
+    return [line("WAIT", `Observation phase ${event.type.slice("command.".length)} for ${String(data.id)} on ${String(data.deviceId)}`)];
+  }
+  if (event.type.startsWith("command.effect.") && event.type.endsWith(".skipped")) {
+    return [line("INFO", `Skipped non-critical side-effect verification for ${String(data.id)}: ${String(data.property)}=${JSON.stringify(data.expected)}`)];
+  }
+  if (event.type.startsWith("zigbee_service.")) {
+    return [line("INFO", `${event.type}: ${String(data.device ?? data.deviceId ?? "")}${data.property ? ` ${String(data.property)}` : ""}${data.durationMs !== undefined ? ` (${String(data.durationMs)}ms)` : ""}`)];
+  }
+  if (event.type.startsWith("zigbee_warm.")) {
+    return [line("INFO", `${event.type}: ${data.count !== undefined ? `${String(data.count)} target(s)` : String(data.deviceId ?? "")}${data.durationMs !== undefined ? ` (${String(data.durationMs)}ms)` : ""}`)];
+  }
+  if (event.type === "zigbee_diag.snapshot") {
+    return [line("INFO", `Diagnostic snapshot captured ${String(data.count)} device(s) (${String(data.reason ?? "interval")})`)];
+  }
   switch (event.type) {
     case "adapter_probe_started": return [line("INFO", `Probing Zigbee adapter on ${String(data.port)}...`)];
     case "adapter_found": return [
@@ -72,8 +89,14 @@ export function renderNarrative(event: HostEvent): string[] {
     case "command_sending": return [line("INFO", `Sending ${String(data.property)}=${JSON.stringify(data.value)} to ${String(data.device)}...`)];
     case "command": return [line("OK", `Command accepted for ${String(data.device)}: ${String(data.property)}=${JSON.stringify(data.value)}`)];
     case "command_confirmed": return [line("OK", `Device confirmed ${String(data.property)}=${JSON.stringify(data.value)} via ${String(data.origin)}`)];
+    case "command.http.received": return [line("INFO", `HTTP command received for ${String(data.deviceId)}/${String(data.componentId)}: ${String(data.action)}`)];
+    case "command.public_state.source": return [line("INFO", `Public state source for ${String(data.deviceId)} via ${String(data.origin)}: ${JSON.stringify(data.payload)}`)];
+    case "command.public_state.emitted": return [line("INFO", `Public state emitted for ${String(data.deviceId)}/${String(data.componentId)} via ${String(data.origin)}: ${JSON.stringify(data.patch)}`)];
     case "command.queued": return [line("QUEUE", `Queued ${String(data.id)} for ${String(data.deviceId)}: ${JSON.stringify(data.requested)}`)];
+    case "command.pending_marked": return [line("INFO", `Pending state marked for ${String(data.id)} on ${String(data.deviceId)}`)];
     case "command.sending": return [line("SEND", `Sending ${String(data.id)} to ${String(data.deviceId)}`)];
+    case "command.physical_send.start": return [line("SEND", `Physical send started for ${String(data.id)} on ${String(data.deviceId)}: ${String(data.property)}=${JSON.stringify(data.requested)}`)];
+    case "command.physical_send.done": return [line("OK", `Physical send finished for ${String(data.id)} on ${String(data.deviceId)}: ${String(data.property)}=${JSON.stringify(data.requested)}`)];
     case "command.observing": return [line("WAIT", `Observing physical outcome for ${String(data.id)}`)];
     case "command.confirmed": return [line("OK", `Command ${String(data.id)} physically confirmed`)];
     case "command.unverifiable": return [line("WARN", `Command ${String(data.id)} was sent but the property is not observable`)];
@@ -130,24 +153,29 @@ export class HostEventHub {
   readonly #subscribers = new Set<(event: HostEvent) => void>();
   readonly #connectionLog: WriteStream;
   readonly #commandLog: WriteStream;
+  readonly #diagnostics?: ZigbeeDiagnosticEventWriter;
   #id = 0;
   readonly streamId = randomUUID();
   readonly #journal: HostEvent[] = [];
   readonly #journalLimit: number;
 
-  private constructor(connectionLog: WriteStream, commandLog: WriteStream, journalLimit: number) {
+  private constructor(connectionLog: WriteStream, commandLog: WriteStream, journalLimit: number, diagnostics?: ZigbeeDiagnosticEventWriter) {
     this.#connectionLog = connectionLog;
     this.#commandLog = commandLog;
     this.#journalLimit = journalLimit;
+    this.#diagnostics = diagnostics;
   }
 
-  static async create(logDirectory: string, journalLimit = 10_000): Promise<HostEventHub> {
+  static async create(logDirectory: string, journalLimit = 10_000, diagnosticOptions: DiagnosticLogOptions = parseDiagnosticLogOptions(process.env, logDirectory)): Promise<HostEventHub> {
     await mkdir(logDirectory, {recursive: true});
+    const diagnostics = new ZigbeeDiagnosticEventWriter(diagnosticOptions);
+    await diagnostics.init();
     const day = new Date().toISOString().slice(0, 10);
     return new HostEventHub(
       createWriteStream(path.join(logDirectory, `connection-${day}.log`), {flags: "a"}),
       createWriteStream(path.join(logDirectory, `commands-${day}.log`), {flags: "a"}),
       journalLimit,
+      diagnostics,
     );
   }
 
@@ -157,6 +185,7 @@ export class HostEventHub {
     if (this.#journal.length > this.#journalLimit) this.#journal.splice(0, this.#journal.length - this.#journalLimit);
     const text = `${renderNarrative(event).join("\n")}\n`;
     (category === "command" || (category === "progress" && requestId) ? this.#commandLog : this.#connectionLog).write(text);
+    this.#diagnostics?.write(event);
     for (const subscriber of this.#subscribers) subscriber(event);
     return event;
   }
@@ -176,7 +205,7 @@ export class HostEventHub {
   }
 
   async close(): Promise<void> {
-    await Promise.all([this.#end(this.#connectionLog), this.#end(this.#commandLog)]);
+    await Promise.all([this.#end(this.#connectionLog), this.#end(this.#commandLog), this.#diagnostics?.close()]);
   }
 
   async #end(stream: WriteStream): Promise<void> {

@@ -13,7 +13,7 @@ import {DeviceCatalog} from "./device-catalog.js";
 import type {LocatedAdapter} from "./adapter-locator.js";
 import {ZigbeeOperationError} from "./zigbee-service.js";
 import type {ManagedZigbeeRuntime} from "./runtime-manager.js";
-import type {ApiDevice, ApiDeviceSummary, DeviceCapability, DeviceInfo, ProbeResult} from "./types.js";
+import type {ApiDevice, ApiDeviceSummary, DeviceCapability, DeviceInfo, ObservationMode, ProbeResult} from "./types.js";
 import {commandValues, normalizeDevice, statePatchForComponent} from "./component-model.js";
 
 interface Operation {
@@ -221,6 +221,10 @@ export class ZigbeeHost {
         if (type === "device_joined") this.#joinPhase = "device discovered";
         if (type === "device_interview") this.#joinPhase = String((data as Record<string, unknown>).status ?? "interviewing");
         if (type === "permit_join" && !(data as Record<string, unknown>).permitted) this.#joinEnd = 0;
+        if (type.startsWith("zigbee_service.") || type.startsWith("zigbee_warm.")) {
+          const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
+          console.log(JSON.stringify({time: new Date().toISOString(), binary: "zigbee-host", msg: `zigbee-host: lifecycle phase=${type}`, ...record}));
+        }
         this.#hub?.emit(type, data, requestId);
         void this.#publishIntegrationEvent(type, data, requestId, manager);
         if (type === "devices" && Array.isArray(data)) void this.#catalog?.replace(data as DeviceInfo[]).catch(() => undefined);
@@ -238,10 +242,15 @@ export class ZigbeeHost {
       if (!device) return;
       const payload = record.payload && typeof record.payload === "object" ? record.payload as Record<string, unknown> : {};
       const state = record.state && typeof record.state === "object" ? record.state as Record<string, unknown> : {};
+      this.#hub?.emit("command.public_state.source", {deviceId, origin: record.origin, payload}, requestId, "command");
       const normalized = normalizeDevice(device, state);
       for (const component of normalized.components) {
         const patch = statePatchForComponent(component, payload);
-        if (Object.keys(patch).length > 0) this.#hub?.emit("component.state_changed", {deviceId, componentId: component.id, revision: Date.now(), patch, origin: record.origin}, requestId, "device");
+        if (Object.keys(patch).length > 0) {
+          const revision = Date.now();
+          this.#hub?.emit("command.public_state.emitted", {deviceId, componentId: component.id, revision, patch, origin: record.origin}, requestId, "command");
+          this.#hub?.emit("component.state_changed", {deviceId, componentId: component.id, revision, patch, origin: record.origin}, requestId, "device");
+        }
       }
       return;
     }
@@ -437,13 +446,25 @@ export class ZigbeeHost {
       } else {
         const deviceMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)$/);
         const componentCommandMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/components\/([^/]+)\/commands$/);
-        if (method === "POST" && componentCommandMatch) {
+        const deviceReadMatch = url.pathname.match(/^\/v1\/devices\/([^/]+)\/read$/);
+        if (method === "POST" && deviceReadMatch) {
+          this.#requireAvailable();
+          const deviceId = this.#deviceId(deviceReadMatch[1]!);
+          const payload = await body(request);
+          if (typeof payload.property !== "string" || !payload.property) throw new HttpError(400, "invalid_request", "property is required");
+          const endpoint = payload.endpoint === undefined ? undefined : String(payload.endpoint);
+          const values = await this.#manager!.gateway.get(deviceId, payload.property, endpoint);
+          this.#hub?.emit("read_result", {deviceId, property: payload.property, endpoint, values}, requestId, "command");
+          json(response, 200, {deviceId, property: payload.property, endpoint, values, requestId});
+        } else if (method === "POST" && componentCommandMatch) {
           this.#requireAvailable();
           const deviceId = this.#deviceId(componentCommandMatch[1]!);
           const componentId = decodeURIComponent(componentCommandMatch[2]!);
           const payload = await body(request);
           if (typeof payload.action !== "string" || !payload.action) throw new HttpError(400, "invalid_request", "action is required");
           const parameters = payload.parameters && typeof payload.parameters === "object" && !Array.isArray(payload.parameters) ? payload.parameters as Record<string, unknown> : {};
+          const requestIDFromPayload = typeof payload.requestId === "string" && payload.requestId ? payload.requestId : requestId;
+          this.#hub?.emit("command.http.received", {deviceId, componentId, action: payload.action, parameters}, requestIDFromPayload, "command");
           const device = await this.#manager!.gateway.getDevice(deviceId);
           const state = this.#manager!.gateway.getStateSnapshotById(deviceId).reported;
           const component = normalizeDevice(device, state).components.find((candidate) => candidate.id === componentId);
@@ -451,10 +472,12 @@ export class ZigbeeHost {
           const values = commandValues(component, payload.action, parameters);
           const timeout = payload.observationTimeoutMs === undefined ? 30_000 : Number(payload.observationTimeoutMs);
           if (!Number.isInteger(timeout) || timeout < 1_000 || timeout > 300_000) throw new HttpError(400, "invalid_observation_timeout", "observationTimeoutMs must be an integer from 1000 through 300000");
+          const observationMode = payload.observationMode === undefined ? "readback" : String(payload.observationMode);
+          if (!["readback", "passive"].includes(observationMode)) throw new HttpError(400, "invalid_observation_mode", "observationMode must be 'readback' or 'passive'");
           const componentEndpoint = component.endpoint;
           const endpoints = componentEndpoint ? Object.fromEntries(Object.keys(values).map((property) => [property, componentEndpoint])) : undefined;
-          const command = await this.#manager!.commands.submit(deviceId, values, timeout, endpoints);
-          const correlation = typeof payload.requestId === "string" && payload.requestId ? payload.requestId : requestId;
+          const command = await this.#manager!.commands.submit(deviceId, values, timeout, endpoints, observationMode as ObservationMode);
+          const correlation = requestIDFromPayload;
           this.#commandRequestIds.set(command.id, correlation);
           response.setHeader("location", `/v1/commands/${command.id}`);
           json(response, 202, {command});

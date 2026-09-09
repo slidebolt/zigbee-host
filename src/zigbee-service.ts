@@ -209,39 +209,56 @@ export class ZigbeeService {
   }
 
   async set(selector: string, property: string, value: unknown, endpointName?: string): Promise<SetResult> {
+    const started = Date.now();
     const {device, definition} = await this.#findDevice(selector);
     const exposed = this.#findExpose(definition, device, property, ACCESS_SET, endpointName);
     const endpoint = this.#endpointFor(device, definition, exposed);
     const converter = definition.toZigbee.find((candidate) => (!candidate.key || candidate.key.includes(property)) && candidate.convertSet);
     if (!converter?.convertSet) throw new Error(`No set converter is available for '${property}'`);
 
+    const context = this.#operationContext(device, definition, property, endpoint, exposed.endpoint);
+    this.#output("zigbee_service.set.start", {...context, value});
     const meta = this.#toZigbeeMeta(device, definition, property, value, exposed.endpoint);
     let result;
     try {
+      const convertStarted = Date.now();
+      this.#output("zigbee_service.convert_set.start", {...context, value});
       result = await converter.convertSet(endpoint, property, value, meta);
+      this.#output("zigbee_service.convert_set.done", {...context, value, expected: result?.state ?? {[property]: value}, durationMs: Date.now() - convertStarted});
       this.#markReachable(device.ieeeAddr);
     } catch (error) {
+      this.#output("zigbee_service.convert_set.failed", {...context, value, durationMs: Date.now() - started, error: error instanceof Error ? error.message : String(error)});
       throw this.#operationError(device.ieeeAddr, "send", error);
     }
     const expected = result?.state ?? {[property]: value};
     if (result?.state) await this.#publishState(device, result.state, "optimistic");
     const state = this.#state.get(device.ieeeAddr);
     this.#output("command", {device: device.ieeeAddr, property, value, expected, state});
+    this.#output("zigbee_service.set.done", {...context, value, expected, durationMs: Date.now() - started});
     return {state, expected};
   }
 
   async get(selector: string, property: string, endpointName?: string): Promise<DeviceState> {
+    const started = Date.now();
     const {device, definition} = await this.#findDevice(selector);
     const exposed = this.#findExpose(definition, device, property, ACCESS_GET, endpointName);
     const endpoint = this.#endpointFor(device, definition, exposed);
     const converter = definition.toZigbee.find((candidate) => (!candidate.key || candidate.key.includes(property)) && candidate.convertGet);
     if (!converter?.convertGet) throw new Error(`No get converter is available for '${property}'`);
+    const context = this.#operationContext(device, definition, property, endpoint, exposed.endpoint);
+    this.#output("zigbee_service.get.start", context);
     try {
+      const convertStarted = Date.now();
+      this.#output("zigbee_service.convert_get.start", context);
       await converter.convertGet(endpoint, property, this.#toZigbeeMeta(device, definition, property, undefined, exposed.endpoint));
+      this.#output("zigbee_service.convert_get.done", {...context, durationMs: Date.now() - convertStarted});
     } catch (error) {
+      this.#output("zigbee_service.convert_get.failed", {...context, durationMs: Date.now() - started, error: error instanceof Error ? error.message : String(error)});
       throw this.#operationError(device.ieeeAddr, "read", error);
     }
-    return this.#state.get(device.ieeeAddr);
+    const state = this.#state.get(device.ieeeAddr);
+    this.#output("zigbee_service.get.done", {...context, durationMs: Date.now() - started, state});
+    return state;
   }
 
   async getCachedState(selector: string): Promise<DeviceState> {
@@ -355,11 +372,27 @@ export class ZigbeeService {
   }
 
   async #handleMessage(data: Events.MessagePayload): Promise<void> {
+    const started = Date.now();
+    this.#output("zigbee_service.message.received", {
+      device: data.device.ieeeAddr,
+      modelID: data.device.modelID,
+      cluster: data.cluster,
+      type: data.type,
+      endpoint: data.endpoint?.ID,
+    });
     const definition = await this.#resolveDefinition(data.device);
     if (!definition) return;
     const converters = definition.fromZigbee.filter((converter) => {
       const types = Array.isArray(converter.type) ? converter.type : [converter.type];
       return converter.cluster === data.cluster && types.includes(data.type as never);
+    });
+    this.#output("zigbee_service.message.converters", {
+      device: data.device.ieeeAddr,
+      model: definition.model,
+      cluster: data.cluster,
+      type: data.type,
+      count: converters.length,
+      durationMs: Date.now() - started,
     });
     if (converters.length === 0) return;
 
@@ -369,6 +402,7 @@ export class ZigbeeService {
     };
     let payload: DeviceState = {};
     for (const converter of converters) {
+      const convertStarted = Date.now();
       const converted = await converter.convert(
         definition,
         data as never,
@@ -376,12 +410,23 @@ export class ZigbeeService {
         {},
         {device: data.device, state: this.#state.get(data.device.ieeeAddr), deviceExposesChanged: () => undefined},
       );
+      this.#output("zigbee_service.message.converted", {
+        device: data.device.ieeeAddr,
+        model: definition.model,
+        cluster: data.cluster,
+        type: data.type,
+        payload: converted ?? {},
+        durationMs: Date.now() - convertStarted,
+      });
       if (converted) payload = {...payload, ...converted};
     }
     if (Object.keys(payload).length > 0) publish(payload);
+    this.#output("zigbee_service.message.done", {device: data.device.ieeeAddr, cluster: data.cluster, type: data.type, payload, durationMs: Date.now() - started});
   }
 
   async #publishState(device: Models.Device, payload: DeviceState, origin: StateOrigin): Promise<DeviceState> {
+    const started = Date.now();
+    this.#output("zigbee_service.state.publish.start", {device: device.ieeeAddr, modelID: device.modelID, origin, payload});
     const state = origin === "optimistic" ? this.#state.get(device.ieeeAddr) : await this.#state.merge(device.ieeeAddr, payload, origin);
     const event: StateEvent = {device: device.ieeeAddr, modelID: device.modelID, payload, state, origin};
     if (origin !== "optimistic") this.#markReachable(device.ieeeAddr);
@@ -398,7 +443,19 @@ export class ZigbeeService {
         waiter.resolve(event);
       }
     }
+    this.#output("zigbee_service.state.publish.done", {device: device.ieeeAddr, modelID: device.modelID, origin, payload, durationMs: Date.now() - started});
     return state;
+  }
+
+  #operationContext(device: Models.Device, definition: Definition, property: string, endpoint: Models.Endpoint, endpointName?: string): Record<string, unknown> {
+    return {
+      device: device.ieeeAddr,
+      modelID: device.modelID,
+      model: definition.model,
+      property,
+      endpoint: endpoint.ID,
+      endpointName,
+    };
   }
 
   async #callOnEvent(device: Models.Device, type: OnEvent.Event["type"]): Promise<void> {

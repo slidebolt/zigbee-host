@@ -11,10 +11,16 @@ export const OPENAPI_DOCUMENT = {
     ], responses: {"200": {description: "Replay followed by live events", content: {"text/event-stream": {}}}, "409": {$ref: "#/components/responses/problem"}}}},
     "/v1/devices": {get: {operationId: "listDevices", responses: {"200": {description: "Paired devices"}}}},
     "/v1/devices/{deviceId}": {get: {operationId: "getDevice", parameters: [{$ref: "#/components/parameters/deviceId"}], responses: {"200": {description: "Device"}}}},
+    "/v1/devices/{deviceId}/read": {post: {
+      operationId: "readDeviceProperty",
+      parameters: [{$ref: "#/components/parameters/deviceId"}],
+      requestBody: {required: true, content: {"application/json": {schema: {type: "object", required: ["property"], properties: {property: {type: "string"}, endpoint: {type: "string"}}}}}},
+      responses: {"200": {description: "Device property read"}, "404": {$ref: "#/components/responses/problem"}},
+    }},
     "/v1/devices/{deviceId}/components/{componentId}/commands": {post: {
       operationId: "submitComponentCommand",
       parameters: [{$ref: "#/components/parameters/deviceId"}, {name: "componentId", in: "path", required: true, schema: {type: "string"}}],
-      requestBody: {required: true, content: {"application/json": {schema: {type: "object", required: ["action"], properties: {action: {type: "string"}, parameters: {type: "object"}, requestId: {type: "string"}, observationTimeoutMs: {type: "integer"}}}}}},
+      requestBody: {required: true, content: {"application/json": {schema: {type: "object", required: ["action"], properties: {action: {type: "string"}, parameters: {type: "object"}, requestId: {type: "string"}, observationTimeoutMs: {type: "integer"}, observationMode: {type: "string", enum: ["readback", "passive"]}}}}}},
       responses: {"202": {description: "Command queued"}, "404": {$ref: "#/components/responses/problem"}},
     }},
     "/v1/commands/{commandId}": {get: {operationId: "getCommand", parameters: [{name: "commandId", in: "path", required: true, schema: {type: "string"}}], responses: {"200": {description: "Command status"}}}},

@@ -1,10 +1,10 @@
 import {randomUUID} from "node:crypto";
 import type {DeviceStateSnapshot} from "./state-store.js";
 import {CommandStore} from "./command-store.js";
-import type {CommandPropertyResult, DeviceCommand, DeviceInfo, SetResult, StateEvent} from "./types.js";
+import type {CommandPropertyResult, DeviceCommand, DeviceInfo, ObservationMode, SetResult, StateEvent} from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const POLL_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000];
+const POLL_DELAYS_MS = [100, 250, 500, 1_000, 2_000];
 const ACCESS_STATE = 0b001;
 const ACCESS_SET = 0b010;
 const ACCESS_GET = 0b100;
@@ -58,10 +58,11 @@ export class DeviceCommandEngine {
     await Promise.allSettled([...this.#queues.values()]);
   }
 
-  async submit(deviceId: string, requested: Record<string, unknown>, observationTimeoutMs = DEFAULT_TIMEOUT_MS, endpoints?: Record<string, string>): Promise<DeviceCommand> {
+  async submit(deviceId: string, requested: Record<string, unknown>, observationTimeoutMs = DEFAULT_TIMEOUT_MS, endpoints?: Record<string, string>, observationMode: ObservationMode = "readback"): Promise<DeviceCommand> {
     if (!Number.isInteger(observationTimeoutMs) || observationTimeoutMs < 1_000 || observationTimeoutMs > 300_000) {
       throw new Error("observationTimeoutMs must be an integer from 1000 through 300000");
     }
+    if (!["readback", "passive"].includes(observationMode)) throw new Error("observationMode must be 'readback' or 'passive'");
     const device = await this.#port.getDevice(deviceId);
     for (const property of Object.keys(requested)) {
       if (!device.exposes.some((expose) => expose.property === property && (endpoints?.[property] === undefined || expose.endpoint === endpoints[property]) && (expose.access & ACCESS_SET) !== 0)) {
@@ -75,6 +76,7 @@ export class DeviceCommandEngine {
       status: "queued",
       requested: structuredClone(requested),
       ...(endpoints && Object.keys(endpoints).length > 0 ? {endpoints: structuredClone(endpoints)} : {}),
+      ...(observationMode === "readback" ? {} : {observationMode}),
       results: {},
       observationTimeoutMs,
       createdAt: now,
@@ -83,6 +85,7 @@ export class DeviceCommandEngine {
     await this.#store.put(command);
     const pending = Object.fromEntries(Object.entries(requested).map(([property, value]) => [stateProperty(property, endpoints?.[property]), value]));
     await this.#port.markPending(deviceId, command.id, pending, now);
+    this.#output("command.pending_marked", structuredClone(command));
     this.#emit(command);
     const previous = this.#queues.get(deviceId) ?? Promise.resolve();
     const execution = previous.catch(() => undefined).then(() => this.#execute(command.id));
@@ -128,29 +131,53 @@ export class DeviceCommandEngine {
           });
         }
         try {
+          this.#output("command.physical_send.start", {
+            id: command.id,
+            deviceId: command.deviceId,
+            property,
+            requested,
+            endpoint,
+            createdAt: command.createdAt,
+            sendingAt: command.sendingAt,
+          });
           const sent: SetResult = await this.#port.set(command.deviceId, property, requested, endpoint);
+          command.sentAt = new Date().toISOString();
+          this.#output("command.physical_send.done", {
+            id: command.id,
+            deviceId: command.deviceId,
+            property,
+            requested,
+            endpoint,
+            expected: sent.expected,
+            createdAt: command.createdAt,
+            sendingAt: command.sendingAt,
+            sentAt: command.sentAt,
+          });
           command.expected = {...command.expected, ...sent.expected};
           expected = Object.hasOwn(sent.expected, property) ? sent.expected[property] : requested;
           for (const event of buffered) {
             if (this.#matches(device, property, eventValue(event, property, endpoint), expected, expose.valueStep)) resolveObservation?.(event);
           }
-          command.sentAt = new Date().toISOString();
           if (!observable || !observation) {
             command.results[property] = {status: "unverifiable", requested, expected, detail: "The property cannot be read or observed"};
             if (terminal === "confirmed") terminal = "unverifiable";
             continue;
           }
           await this.#transition(command, "observing", {sentAt: command.sentAt});
-          const result = await this.#observe(command, property, requested, expected, observation, (expose.access & ACCESS_GET) !== 0, endpoint);
+          const mode = command.observationMode ?? "readback";
+          const result = await this.#observe(command, property, requested, expected, observation, mode === "readback" && (expose.access & ACCESS_GET) !== 0, endpoint, mode);
           command.results[property] = result;
           if (result.status === "inconclusive") terminal = "inconclusive";
           else if (result.status === "unverifiable" && terminal === "confirmed") terminal = "unverifiable";
           for (const [effectProperty, effectExpected] of Object.entries(sent.expected)) {
             if (effectProperty === property || Object.hasOwn(command.results, effectProperty)) continue;
-            const effect = await this.#observeEffect(command, device, effectProperty, effectExpected, endpoint);
-            command.results[effectProperty] = effect;
-            if (effect.status === "inconclusive") terminal = "inconclusive";
-            else if (effect.status === "unverifiable" && terminal === "confirmed") terminal = "unverifiable";
+            this.#mark(command, `effect.${effectProperty}.skipped`, {property: effectProperty, expected: effectExpected, reason: "non_blocking_side_effect"});
+            command.results[effectProperty] = {
+              status: "unverifiable",
+              requested: effectExpected,
+              expected: effectExpected,
+              detail: "Side-effect verification skipped on the command critical path",
+            };
           }
         } finally {
           unsubscribe?.();
@@ -175,47 +202,43 @@ export class DeviceCommandEngine {
     }
   }
 
-  async #observe(command: DeviceCommand, property: string, requested: unknown, expected: unknown, observation: Promise<StateEvent>, readable: boolean, endpoint?: string): Promise<CommandPropertyResult> {
+  async #observe(command: DeviceCommand, property: string, requested: unknown, expected: unknown, observation: Promise<StateEvent>, readable: boolean, endpoint: string | undefined, mode: ObservationMode): Promise<CommandPropertyResult> {
     const deadline = Date.now() + command.observationTimeoutMs;
     let poll = 0;
     const stop = abortWait(this.#abort.signal);
     try {
+      this.#mark(command, `observe.${property}.start`, {property, requested, expected, readable, endpoint, mode});
       while (Date.now() < deadline) {
         const delay = POLL_DELAYS_MS[Math.min(poll, POLL_DELAYS_MS.length - 1)]!;
+        this.#mark(command, `observe.${property}.wait.${poll}.start`, {property, delayMs: delay, endpoint});
         const event = await Promise.race([
           observation.then((value) => ({value})),
           sleep(Math.min(delay, Math.max(0, deadline - Date.now()))).then(() => undefined),
           stop.promise.then(() => { throw new Error("Command engine stopped"); }),
         ]);
-        if (event) return {status: "confirmed", requested, expected, observed: eventValue(event.value, property, endpoint), origin: event.value.origin};
-        if (readable) await this.#port.get(command.deviceId, property, endpoint).catch(() => undefined);
+        if (event) {
+          const observed = eventValue(event.value, property, endpoint);
+          this.#mark(command, `observe.${property}.matched`, {property, expected, observed, origin: event.value.origin, endpoint});
+          return {status: "confirmed", requested, expected, observed, origin: event.value.origin};
+        }
+        if (readable) {
+          this.#mark(command, `observe.${property}.read.${poll}.start`, {property, endpoint});
+          await this.#port.get(command.deviceId, property, endpoint)
+            .then((values) => this.#mark(command, `observe.${property}.read.${poll}.done`, {property, values, endpoint}))
+            .catch((error: unknown) => this.#mark(command, `observe.${property}.read.${poll}.failed`, {property, error: error instanceof Error ? error.message : String(error), endpoint}));
+        }
         poll++;
       }
       const final = await Promise.race([observation.then((value) => ({value})), sleep(25).then(() => undefined)]);
-      if (final) return {status: "confirmed", requested, expected, observed: eventValue(final.value, property, endpoint), origin: final.value.origin};
+      if (final) {
+        const observed = eventValue(final.value, property, endpoint);
+        this.#mark(command, `observe.${property}.matched`, {property, expected, observed, origin: final.value.origin, endpoint});
+        return {status: "confirmed", requested, expected, observed, origin: final.value.origin};
+      }
+      this.#mark(command, `observe.${property}.timeout`, {property, expected, endpoint});
       return {status: "inconclusive", requested, expected, detail: `No matching physical observation within ${command.observationTimeoutMs}ms`};
     } finally {
       stop.dispose();
-    }
-  }
-
-  async #observeEffect(command: DeviceCommand, device: DeviceInfo, property: string, expected: unknown, endpoint?: string): Promise<CommandPropertyResult> {
-    const expose = device.exposes.find((candidate) => candidate.property === property && (endpoint === undefined || candidate.endpoint === endpoint));
-    if (!expose || (expose.access & (ACCESS_STATE | ACCESS_GET)) === 0) {
-      return {status: "unverifiable", requested: expected, expected, detail: "The expected side effect cannot be read or observed"};
-    }
-    let unsubscribe = (): void => undefined;
-    const observation = new Promise<StateEvent>((resolve) => {
-      unsubscribe = this.#port.subscribeState((event) => {
-        const actual = eventValue(event, property, endpoint);
-        if (event.origin !== "optimistic" && event.device.toLowerCase() === command.deviceId && actual !== undefined
-          && this.#matches(device, property, actual, expected, expose.valueStep)) resolve(event);
-      });
-    });
-    try {
-      return await this.#observe(command, property, expected, expected, observation, (expose.access & ACCESS_GET) !== 0, endpoint);
-    } finally {
-      unsubscribe();
     }
   }
 
@@ -223,6 +246,13 @@ export class DeviceCommandEngine {
     Object.assign(command, fields, {status, updatedAt: new Date().toISOString()});
     await this.#store.put(command);
     this.#emit(command);
+  }
+
+  #mark(command: DeviceCommand, phase: string, data: Record<string, unknown> = {}): string {
+    const at = new Date().toISOString();
+    command.timeline = {...command.timeline, [phase]: at};
+    this.#output(`command.${phase}`, {id: command.id, deviceId: command.deviceId, at, ...data});
+    return at;
   }
 
   #emit(command: DeviceCommand): void {

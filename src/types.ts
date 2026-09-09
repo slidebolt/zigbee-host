@@ -174,6 +174,7 @@ export interface StateEvent {
 }
 
 export type CommandStatus = "queued" | "sending" | "observing" | "confirmed" | "unverifiable" | "inconclusive" | "failed" | "interrupted";
+export type ObservationMode = "readback" | "passive";
 
 export interface CommandPropertyResult {
   status: "confirmed" | "unverifiable" | "inconclusive" | "failed";
@@ -190,8 +191,10 @@ export interface DeviceCommand {
   status: CommandStatus;
   requested: Record<string, unknown>;
   endpoints?: Record<string, string>;
+  observationMode?: ObservationMode;
   expected?: Record<string, unknown>;
   results: Record<string, CommandPropertyResult>;
+  timeline?: Record<string, string>;
   observationTimeoutMs: number;
   createdAt: string;
   updatedAt: string;

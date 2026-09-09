@@ -8,16 +8,20 @@ interface CommandFile {
 }
 
 const ACTIVE = new Set(["queued", "sending", "observing"]);
+const DEFAULT_MAX_TERMINAL_COMMANDS = 100;
 
 export class CommandStore {
   readonly #file: string;
   readonly #retentionMs: number;
+  readonly #maxTerminalCommands: number;
   #commands = new Map<string, DeviceCommand>();
   #pendingSave: Promise<void> = Promise.resolve();
 
-  constructor(file: string, retentionMs = 7 * 24 * 60 * 60 * 1000) {
+  constructor(file: string, retentionMs = 7 * 24 * 60 * 60 * 1000, maxTerminalCommands = DEFAULT_MAX_TERMINAL_COMMANDS) {
+    if (!Number.isInteger(maxTerminalCommands) || maxTerminalCommands < 0) throw new Error("maxTerminalCommands must be a non-negative integer");
     this.#file = file;
     this.#retentionMs = retentionMs;
+    this.#maxTerminalCommands = maxTerminalCommands;
   }
 
   async load(): Promise<DeviceCommand[]> {
@@ -74,6 +78,12 @@ export class CommandStore {
     for (const [id, command] of commands) {
       if (!ACTIVE.has(command.status) && Date.parse(command.completedAt ?? command.updatedAt) < cutoff) commands.delete(id);
     }
+    const terminal = [...commands.values()]
+      .filter((command) => !ACTIVE.has(command.status))
+      .sort((left, right) => timestamp(right) - timestamp(left));
+    for (const command of terminal.slice(this.#maxTerminalCommands)) {
+      commands.delete(command.id);
+    }
   }
 
   async #saveQueued(): Promise<void> {
@@ -88,4 +98,8 @@ export class CommandStore {
     await writeFile(temporary, `${JSON.stringify(file, null, 2)}\n`, "utf8");
     await rename(temporary, this.#file);
   }
+}
+
+function timestamp(command: DeviceCommand): number {
+  return Date.parse(command.completedAt ?? command.updatedAt ?? command.createdAt);
 }
