@@ -56,6 +56,8 @@ const DIAGNOSTIC_EVENT_TYPES = new Set([
   "zigbee_warm.read.done",
   "zigbee_warm.read.failed",
   "zigbee_warm.read.skipped",
+  "zigbee_warm.read.recovered",
+  "zigbee_warm.targets",
 ]);
 
 export function parseDeviceIdSet(value: string | undefined): Set<string> | undefined {

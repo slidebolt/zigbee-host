@@ -221,7 +221,7 @@ export class ZigbeeHost {
         if (type === "device_joined") this.#joinPhase = "device discovered";
         if (type === "device_interview") this.#joinPhase = String((data as Record<string, unknown>).status ?? "interviewing");
         if (type === "permit_join" && !(data as Record<string, unknown>).permitted) this.#joinEnd = 0;
-        if (type.startsWith("zigbee_service.") || type.startsWith("zigbee_warm.")) {
+        if (type.startsWith("zigbee_service.") || printWarmEvent(type, data)) {
           const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
           console.log(JSON.stringify({time: new Date().toISOString(), binary: "zigbee-host", msg: `zigbee-host: lifecycle phase=${type}`, ...record}));
         }
@@ -642,4 +642,14 @@ async function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promis
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Warm-loop events printed to stdout. Per-read chatter (start/done/pending) stays
+ * in the event hub and diagnostics; stdout gets lifecycle, outages and recoveries.
+ */
+export function printWarmEvent(type: string, data: unknown): boolean {
+  if (!type.startsWith("zigbee_warm.")) return false;
+  if (type === "zigbee_warm.read.failed") return Boolean((data as {unreachable?: unknown} | undefined)?.unreachable);
+  return ["zigbee_warm.started", "zigbee_warm.stopped", "zigbee_warm.sweep.failed", "zigbee_warm.read.recovered", "zigbee_warm.targets"].includes(type);
 }

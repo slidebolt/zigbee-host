@@ -4,6 +4,7 @@ import type {Definition, OnEvent, Tz} from "zigbee-herdsman-converters";
 import type {CoordinatorConnection, CoordinatorEvent} from "./coordinator-connection.js";
 import {flattenExposes} from "./device-utils.js";
 import {StateStore, type DeviceState, type DeviceStateSnapshot} from "./state-store.js";
+import {ReachabilityTracker} from "./reachability.js";
 import type {
   DeviceInfo,
   ExposedProperty,
@@ -11,7 +12,6 @@ import type {
   StateEvent,
   StateOrigin,
   SetResult,
-  DeviceReachability,
 } from "./types.js";
 
 const ACCESS_SET = 0b010;
@@ -52,7 +52,7 @@ export class ZigbeeService {
     timer: NodeJS.Timeout;
   }>();
   readonly #stateSubscribers = new Set<(event: StateEvent) => void>();
-  readonly #reachability = new Map<string, DeviceReachability>();
+  readonly #reachability = new ReachabilityTracker();
 
   constructor(options: ZigbeeServiceOptions) {
     this.#connection = options.connection;
@@ -67,7 +67,7 @@ export class ZigbeeService {
     this.#unsubscribe = this.#connection.subscribe((event) => this.#handleCoordinatorEvent(event));
     this.#started = true;
     for (const device of this.#connection.devices((candidate) => candidate.type !== "Coordinator")) {
-      if (!this.#reachability.has(device.ieeeAddr)) this.#reachability.set(device.ieeeAddr, {status: "unknown"});
+      this.#reachability.ensure(device.ieeeAddr);
       const definition = await this.#resolveDefinition(device);
       await this.#callOnEvent(device, "start");
       if (definition?.configure && device.meta.configured !== definition.version) {
@@ -509,9 +509,7 @@ export class ZigbeeService {
     } else if (event.type === "permitJoinChanged") {
       this.#output("permit_join", event.data);
     } else if (event.type === "adapterDisconnected") {
-      for (const [ieeeAddress, current] of this.#reachability) {
-        this.#reachability.set(ieeeAddress, {...current, status: "unknown", reason: "coordinator_disconnected"});
-      }
+      this.#reachability.markAllUnknown("coordinator_disconnected");
       this.#output("adapter_disconnected", {});
     } else if (event.type === "message") {
       void this.#handleMessage(event.data).catch((error) => this.#eventError("message", error));
@@ -523,10 +521,8 @@ export class ZigbeeService {
   }
 
   #markReachable(ieeeAddress: string): void {
-    const now = new Date().toISOString();
-    const next: DeviceReachability = {status: "reachable", lastSeen: now, lastSuccess: now};
-    this.#reachability.set(ieeeAddress, next);
-    this.#output("device_reachability", {deviceId: ieeeAddress, reachability: next});
+    const {record, changed} = this.#reachability.markReachable(ieeeAddress);
+    if (changed) this.#output("device_reachability", {deviceId: ieeeAddress, reachability: record});
   }
 
   #operationError(ieeeAddress: string, phase: "send" | "read", error: unknown): ZigbeeOperationError {
@@ -534,9 +530,8 @@ export class ZigbeeService {
     const code = detail.includes("Delivery failed") ? "device_unreachable" : detail.includes("Coordinator connection is not open") ? "coordinator_disconnected" : /timed? out|timeout/i.test(detail) ? "transport_timeout" : "zigbee_operation_failed";
     if (code === "device_unreachable" || code === "transport_timeout") {
       const at = new Date().toISOString();
-      const reachability: DeviceReachability = {status: "unreachable", reason: code, lastFailure: {at, code, phase, detail}};
-      this.#reachability.set(ieeeAddress, reachability);
-      this.#output("device_reachability", {deviceId: ieeeAddress, reachability});
+      const {record, changed} = this.#reachability.markUnreachable(ieeeAddress, code, {at, code, phase, detail});
+      if (changed) this.#output("device_reachability", {deviceId: ieeeAddress, reachability: record});
     }
     return new ZigbeeOperationError(code, phase, code !== "zigbee_operation_failed", detail, {cause: error});
   }

@@ -38,3 +38,15 @@ test("only the canonical device command routes are documented and implemented", 
   assert.ok(source.includes("componentCommandMatch"));
   assert.ok(source.includes("event_cursor_expired"));
 });
+
+test("printWarmEvent prints lifecycle, outages and recoveries but not per-read chatter", async () => {
+  const {printWarmEvent} = await import("./host-server.js");
+  assert.equal(printWarmEvent("zigbee_warm.read.start", {}), false);
+  assert.equal(printWarmEvent("zigbee_warm.read.done", {}), false);
+  assert.equal(printWarmEvent("zigbee_warm.read.pending", {}), false);
+  assert.equal(printWarmEvent("zigbee_warm.read.failed", {unreachable: false}), false);
+  assert.equal(printWarmEvent("zigbee_warm.read.failed", {unreachable: true}), true);
+  assert.equal(printWarmEvent("zigbee_warm.read.recovered", {}), true);
+  assert.equal(printWarmEvent("zigbee_warm.started", {}), true);
+  assert.equal(printWarmEvent("zigbee_service.get.start", {}), false);
+});

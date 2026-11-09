@@ -31,7 +31,16 @@ export class ZigbeeRuntimeManager implements ManagedZigbeeRuntime {
   constructor(options: RuntimeManagerOptions) {
     const paths = runtimePaths(options.dataDirectory);
     this.connection = new EmberCoordinatorConnection(options);
-    this.gateway = new ZigbeeService({connection: this.connection, stateFile: paths.state, output: options.output});
+    // A device that reappears on its own (report, announce, command) goes back on the warm loop's normal schedule.
+    const output = (event: string, data: unknown): void => {
+      if (event === "device_reachability") {
+        const record = data as {deviceId?: unknown; reachability?: {status?: unknown}};
+        if (record.reachability?.status === "reachable" && typeof record.deviceId === "string") this.#warmer?.noteSeen(record.deviceId);
+      }
+      if (options.output) options.output(event, data);
+      else console.log(JSON.stringify({event, data}));
+    };
+    this.gateway = new ZigbeeService({connection: this.connection, stateFile: paths.state, output});
     this.commands = new DeviceCommandEngine({port: this.gateway, storeFile: paths.commands, output: options.output});
     this.#warmer = new ZigbeeWarmLoop({port: this.gateway, output: options.output, ...parseWarmLoopOptions()});
     this.#diagnostics = new ZigbeeDiagnosticSnapshotLoop({port: this.gateway, output: options.output, ...parseDiagnosticSnapshotOptions()});
