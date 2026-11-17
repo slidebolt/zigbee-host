@@ -5,6 +5,7 @@ import type {CoordinatorConnection, CoordinatorEvent} from "./coordinator-connec
 import {flattenExposes} from "./device-utils.js";
 import {StateStore, type DeviceState, type DeviceStateSnapshot} from "./state-store.js";
 import {ReachabilityTracker} from "./reachability.js";
+import {OperationQueue} from "./operation-queue.js";
 import type {
   DeviceInfo,
   ExposedProperty,
@@ -21,6 +22,8 @@ export interface ZigbeeServiceOptions {
   connection: CoordinatorConnection;
   stateFile: string;
   output?: (event: string, data: unknown) => void;
+  /** Maximum physical reads/writes allowed on the shared coordinator radio. */
+  operationConcurrency?: number;
 }
 
 export class ZigbeeOperationError extends Error {
@@ -53,11 +56,13 @@ export class ZigbeeService {
   }>();
   readonly #stateSubscribers = new Set<(event: StateEvent) => void>();
   readonly #reachability = new ReachabilityTracker();
+  readonly #operations: OperationQueue;
 
   constructor(options: ZigbeeServiceOptions) {
     this.#connection = options.connection;
     this.#state = new StateStore(options.stateFile);
     this.#output = options.output ?? ((event, data) => console.log(JSON.stringify({event, data})));
+    this.#operations = new OperationQueue(options.operationConcurrency ?? 1);
   }
 
   async start(): Promise<void> {
@@ -223,7 +228,7 @@ export class ZigbeeService {
     try {
       const convertStarted = Date.now();
       this.#output("zigbee_service.convert_set.start", {...context, value});
-      result = await converter.convertSet(endpoint, property, value, meta);
+      result = await this.#operations.run(() => converter.convertSet!(endpoint, property, value, meta));
       this.#output("zigbee_service.convert_set.done", {...context, value, expected: result?.state ?? {[property]: value}, durationMs: Date.now() - convertStarted});
       this.#markReachable(device.ieeeAddr);
     } catch (error) {
@@ -250,7 +255,7 @@ export class ZigbeeService {
     try {
       const convertStarted = Date.now();
       this.#output("zigbee_service.convert_get.start", context);
-      await converter.convertGet(endpoint, property, this.#toZigbeeMeta(device, definition, property, undefined, exposed.endpoint));
+      await this.#operations.run(() => converter.convertGet!(endpoint, property, this.#toZigbeeMeta(device, definition, property, undefined, exposed.endpoint)));
       this.#output("zigbee_service.convert_get.done", {...context, durationMs: Date.now() - convertStarted});
     } catch (error) {
       this.#output("zigbee_service.convert_get.failed", {...context, durationMs: Date.now() - started, error: error instanceof Error ? error.message : String(error)});
