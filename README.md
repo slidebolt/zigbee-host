@@ -21,3 +21,22 @@ docker run --rm \
 
 Pairing is never opened automatically. Call `POST /v1/pairing/start` only when
 a device is ready to join, or use the coordinator entities in Slidebolt.
+
+## Radio dispatch
+
+Command submission is asynchronous: the API returns `202` after validating and
+persisting the intent, without waiting for a physical Zigbee transmission. The
+host owns radio scheduling with these rules:
+
+- different devices may transmit concurrently;
+- one device never has overlapping physical operations;
+- commands run before reconciliation reads, which run before background polls;
+- a newer unsent value for the same device, property, and endpoint supersedes
+  the older queued value;
+- a slow or unreachable device does not occupy every radio slot.
+
+The defaults are four total operations and one background operation. Configure
+startup with `ZIGBEE_MAX_IN_FLIGHT` (1–16) and
+`ZIGBEE_MAX_BACKGROUND_IN_FLIGHT` (0–the total). Inspect or tune a running host
+through authenticated `GET /v1/dispatcher` and `PATCH /v1/dispatcher`; the
+effective dispatcher status is also included in `GET /v1/health`.

@@ -11,7 +11,7 @@ const ACCESS_GET = 0b100;
 
 export interface CommandDevicePort {
   getDevice(deviceId: string): Promise<DeviceInfo>;
-  set(deviceId: string, property: string, value: unknown, endpoint?: string): Promise<SetResult>;
+  set(deviceId: string, property: string, value: unknown, endpoint?: string, scheduling?: {operationId?: string; onDispatch?: () => void | Promise<void>}): Promise<SetResult>;
   get(deviceId: string, property: string, endpoint?: string): Promise<Record<string, unknown>>;
   subscribeState(subscriber: (event: StateEvent) => void): () => void;
   markPending(deviceId: string, commandId: string, values: Record<string, unknown>, requestedAt: string): Promise<void>;
@@ -31,7 +31,7 @@ export class DeviceCommandEngine {
   readonly #port: CommandDevicePort;
   readonly #store: CommandStore;
   readonly #output: (event: string, data: unknown) => void;
-  readonly #queues = new Map<string, Promise<void>>();
+  readonly #executions = new Set<Promise<void>>();
   readonly #valueMatcher?: CommandEngineOptions["valueMatcher"];
   #abort = new AbortController();
   #stopping = false;
@@ -55,7 +55,7 @@ export class DeviceCommandEngine {
   async stop(): Promise<void> {
     this.#stopping = true;
     this.#abort.abort();
-    await Promise.allSettled([...this.#queues.values()]);
+    await Promise.allSettled([...this.#executions]);
   }
 
   async submit(deviceId: string, requested: Record<string, unknown>, observationTimeoutMs = DEFAULT_TIMEOUT_MS, endpoints?: Record<string, string>, observationMode: ObservationMode = "readback"): Promise<DeviceCommand> {
@@ -87,11 +87,13 @@ export class DeviceCommandEngine {
     await this.#port.markPending(deviceId, command.id, pending, now);
     this.#output("command.pending_marked", structuredClone(command));
     this.#emit(command);
-    const previous = this.#queues.get(deviceId) ?? Promise.resolve();
-    const execution = previous.catch(() => undefined).then(() => this.#execute(command.id));
-    this.#queues.set(deviceId, execution);
+    // Each accepted intent enters the shared radio dispatcher immediately.
+    // The dispatcher preserves per-device physical ordering and may replace an
+    // older unsent operation for the same property with this newer intent.
+    const execution = this.#execute(command.id);
+    this.#executions.add(execution);
     void execution.finally(() => {
-      if (this.#queues.get(deviceId) === execution) this.#queues.delete(deviceId);
+      this.#executions.delete(execution);
     });
     return this.#store.get(command.id)!;
   }
@@ -109,7 +111,6 @@ export class DeviceCommandEngine {
     if (!command) return;
     let pendingCleared = false;
     try {
-      await this.#transition(command, "sending", {sendingAt: new Date().toISOString()});
       const device = await this.#port.getDevice(command.deviceId);
       let terminal: DeviceCommand["status"] = "confirmed";
       for (const [property, requested] of Object.entries(command.requested)) {
@@ -131,16 +132,21 @@ export class DeviceCommandEngine {
           });
         }
         try {
-          this.#output("command.physical_send.start", {
-            id: command.id,
-            deviceId: command.deviceId,
-            property,
-            requested,
-            endpoint,
-            createdAt: command.createdAt,
-            sendingAt: command.sendingAt,
+          const sent: SetResult = await this.#port.set(command.deviceId, property, requested, endpoint, {
+            operationId: command.id,
+            onDispatch: async () => {
+              await this.#transition(command, "sending", {sendingAt: new Date().toISOString()});
+              this.#output("command.physical_send.start", {
+                id: command.id,
+                deviceId: command.deviceId,
+                property,
+                requested,
+                endpoint,
+                createdAt: command.createdAt,
+                sendingAt: command.sendingAt,
+              });
+            },
           });
-          const sent: SetResult = await this.#port.set(command.deviceId, property, requested, endpoint);
           command.sentAt = new Date().toISOString();
           this.#output("command.physical_send.done", {
             id: command.id,
@@ -187,6 +193,16 @@ export class DeviceCommandEngine {
       pendingCleared = true;
       await this.#transition(command, terminal, {completedAt: new Date().toISOString()});
     } catch (error) {
+      if (isSuperseded(error)) {
+        await this.#port.clearPending(command.deviceId, command.id).catch(() => undefined);
+        pendingCleared = true;
+        await this.#transition(command, "superseded", {
+          completedAt: new Date().toISOString(),
+          supersededBy: error.supersededBy,
+          error: error.message,
+        });
+        return;
+      }
       command.error = this.#stopping ? "The host stopped before command observation completed; the command was not resent" : error instanceof Error ? error.message : String(error);
       if (!this.#stopping && error && typeof error === "object" && "code" in error && "phase" in error) {
         const failure = error as {code: string; phase: "send" | "read" | "observe"; retryable?: boolean; message?: string};
@@ -262,6 +278,10 @@ export class DeviceCommandEngine {
   #matches(device: DeviceInfo, property: string, actual: unknown, expected: unknown, step?: number): boolean {
     return this.#valueMatcher?.({device, property, actual, expected}) ?? valueMatches(actual, expected, step);
   }
+}
+
+function isSuperseded(error: unknown): error is Error & {code: "operation_superseded"; supersededBy?: string} {
+  return error instanceof Error && "code" in error && error.code === "operation_superseded";
 }
 
 function stateProperty(property: string, endpoint?: string): string { return endpoint ? `${property}_${endpoint}` : property; }

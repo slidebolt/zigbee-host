@@ -42,7 +42,14 @@ export class ZigbeeRuntimeManager implements ManagedZigbeeRuntime {
     };
     this.gateway = new ZigbeeService({connection: this.connection, stateFile: paths.state, output});
     this.commands = new DeviceCommandEngine({port: this.gateway, storeFile: paths.commands, output: options.output});
-    this.#warmer = new ZigbeeWarmLoop({port: this.gateway, output: options.output, ...parseWarmLoopOptions()});
+    this.#warmer = new ZigbeeWarmLoop({
+      port: {
+        listDevices: () => this.gateway.listDevices(),
+        get: (deviceId, property, endpoint) => this.gateway.getBackground(deviceId, property, endpoint),
+      },
+      output: options.output,
+      ...parseWarmLoopOptions(),
+    });
     this.#diagnostics = new ZigbeeDiagnosticSnapshotLoop({port: this.gateway, output: options.output, ...parseDiagnosticSnapshotOptions()});
   }
 

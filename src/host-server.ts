@@ -363,7 +363,7 @@ export class ZigbeeHost {
       this.#hub?.emit("http_request", {method, path: url.pathname}, requestId, "command");
 
       if (method === "GET" && url.pathname === "/v1/health") {
-        json(response, 200, {version: 1, status: this.#maintenance ? "maintenance" : this.#connectionState === "connected" ? "ready" : "degraded", pid: process.pid, coordinator: this.#coordinatorStatus(), requestId});
+        json(response, 200, {version: 1, status: this.#maintenance ? "maintenance" : this.#connectionState === "connected" ? "ready" : "degraded", pid: process.pid, coordinator: this.#coordinatorStatus(), dispatcher: this.#manager?.gateway.dispatcherStatus?.(), requestId});
       } else if (method === "GET" && url.pathname === "/v1/snapshot") {
         json(response, 200, await this.#snapshot());
       } else if (method === "GET" && url.pathname === "/v1/openapi.json") {
@@ -379,13 +379,28 @@ export class ZigbeeHost {
         const requestedDeviceId = url.searchParams.get("deviceId");
         const deviceId = requestedDeviceId === null ? undefined : this.#deviceId(requestedDeviceId);
         const status = url.searchParams.get("status") ?? undefined;
-        if (status && !["queued", "sending", "observing", "confirmed", "unverifiable", "inconclusive", "failed", "interrupted"].includes(status)) {
+        if (status && !["queued", "sending", "observing", "confirmed", "unverifiable", "inconclusive", "failed", "superseded", "interrupted"].includes(status)) {
           throw new HttpError(400, "invalid_command_status", "status is not a valid command lifecycle state");
         }
         const limit = Number(url.searchParams.get("limit") ?? 100);
         if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new HttpError(400, "invalid_limit", "limit must be an integer from 1 through 500");
         const items = (this.#manager?.commands ?? this.#offlineCommands!).list({deviceId, status, limit});
         json(response, 200, {items, count: items.length});
+      } else if (method === "GET" && url.pathname === "/v1/dispatcher") {
+        this.#requireAvailable();
+        json(response, 200, {dispatcher: this.#manager!.gateway.dispatcherStatus(), requestId});
+      } else if (method === "PATCH" && url.pathname === "/v1/dispatcher") {
+        this.#requireAvailable();
+        const payload = await body(request);
+        const maxInFlight = Number(payload.maxInFlight);
+        const maxBackgroundInFlight = payload.maxBackgroundInFlight === undefined ? undefined : Number(payload.maxBackgroundInFlight);
+        if (!Number.isInteger(maxInFlight) || maxInFlight < 1 || maxInFlight > 16) throw new HttpError(400, "invalid_max_in_flight", "maxInFlight must be an integer from 1 through 16");
+        if (maxBackgroundInFlight !== undefined && (!Number.isInteger(maxBackgroundInFlight) || maxBackgroundInFlight < 0 || maxBackgroundInFlight > maxInFlight)) {
+          throw new HttpError(400, "invalid_max_background_in_flight", "maxBackgroundInFlight must be an integer from 0 through maxInFlight");
+        }
+        const dispatcher = this.#manager!.gateway.configureDispatcher(maxInFlight, maxBackgroundInFlight);
+        this.#hub?.emit("dispatcher.configured", dispatcher, requestId, "command");
+        json(response, 200, {dispatcher, requestId});
       } else if (method === "GET" && url.pathname.startsWith("/v1/commands/")) {
         const command = (this.#manager?.commands ?? this.#offlineCommands!).get(url.pathname.slice("/v1/commands/".length));
         if (!command) throw new HttpError(404, "command_not_found", "command not found");

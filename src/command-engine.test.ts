@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {DeviceCommandEngine, type CommandDevicePort, valueMatches} from "./command-engine.js";
 import {CommandStore} from "./command-store.js";
+import {OperationDispatcher} from "./operation-dispatcher.js";
 import type {DeviceCommand, DeviceInfo, StateEvent, StateOrigin} from "./types.js";
 
 const ieeeAddress = "0x00124b0000000001";
@@ -29,16 +30,25 @@ class FakePort implements CommandDevicePort {
   gets = 0;
   sideEffects: Record<string, unknown> = {};
   readonly values: Record<string, unknown> = {};
+  #sendTail: Promise<void> = Promise.resolve();
 
   async getDevice(): Promise<DeviceInfo> { return device(this.access); }
-  async set(_deviceId: string, property: string, value: unknown) {
-    this.sent.push(value);
-    this.lastRequested = value;
-    this.values[property] = value;
-    Object.assign(this.values, this.sideEffects);
-    this.publish(property, value, "optimistic");
-    if (this.staleAfterSet !== undefined) this.publish(property, this.staleAfterSet, "read-response");
-    return {state: {}, expected: {[property]: value, ...this.sideEffects}};
+  async set(_deviceId: string, property: string, value: unknown, _endpoint?: string, scheduling?: {onDispatch?: () => void | Promise<void>}) {
+    let resolve!: (value: {state: Record<string, unknown>; expected: Record<string, unknown>}) => void;
+    let reject!: (reason: unknown) => void;
+    const result = new Promise<{state: Record<string, unknown>; expected: Record<string, unknown>}>((done, failed) => { resolve = done; reject = failed; });
+    const execution = this.#sendTail.catch(() => undefined).then(async () => {
+      await scheduling?.onDispatch?.();
+      this.sent.push(value);
+      this.lastRequested = value;
+      this.values[property] = value;
+      Object.assign(this.values, this.sideEffects);
+      this.publish(property, value, "optimistic");
+      if (this.staleAfterSet !== undefined) this.publish(property, this.staleAfterSet, "read-response");
+      resolve({state: {}, expected: {[property]: value, ...this.sideEffects}});
+    }).catch(reject);
+    this.#sendTail = execution;
+    return result;
   }
   async get(_deviceId: string, property: string) {
     this.gets++;
@@ -59,11 +69,25 @@ class FakePort implements CommandDevicePort {
   }
 }
 
+class DispatchingFakePort extends FakePort {
+  readonly dispatcher = new OperationDispatcher({maxInFlight: 1});
+
+  override async set(deviceId: string, property: string, value: unknown, endpoint?: string, scheduling?: {operationId?: string; onDispatch?: () => void | Promise<void>}) {
+    return this.dispatcher.run({
+      deviceId,
+      priority: "command",
+      operationId: scheduling?.operationId,
+      replaceKey: `${property}:${endpoint ?? ""}`,
+      onDispatch: scheduling?.onDispatch,
+    }, () => super.set(deviceId, property, value, endpoint));
+  }
+}
+
 async function terminal(engine: DeviceCommandEngine, id: string, timeoutMs = 3_000): Promise<DeviceCommand> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const command = engine.get(id)!;
-    if (["confirmed", "unverifiable", "inconclusive", "failed", "interrupted"].includes(command.status)) return command;
+    if (["confirmed", "unverifiable", "inconclusive", "failed", "superseded", "interrupted"].includes(command.status)) return command;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error("command did not reach a terminal state");
@@ -89,7 +113,7 @@ test("stale and optimistic values do not confirm; bounded read-back observes the
   }
 });
 
-test("commands for one device execute in FIFO order", async () => {
+test("physical sends for one device remain FIFO while newer intent can supersede confirmation", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "zigbee-command-fifo-"));
   try {
     const port = new FakePort();
@@ -97,9 +121,35 @@ test("commands for one device execute in FIFO order", async () => {
     await engine.start();
     const first = await engine.submit(ieeeAddress, {brightness: 10}, 1_000);
     const second = await engine.submit(ieeeAddress, {brightness: 20}, 1_000);
-    assert.equal((await terminal(engine, first.id)).status, "confirmed");
+    assert.ok(["confirmed", "inconclusive"].includes((await terminal(engine, first.id)).status));
     assert.equal((await terminal(engine, second.id)).status, "confirmed");
     assert.deepEqual(port.sent, [10, 20]);
+  } finally {
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test("accepted calls return while the radio is busy and newest unsent intent wins", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "zigbee-command-supersede-"));
+  try {
+    const port = new DispatchingFakePort();
+    let release!: () => void;
+    const blocked = port.dispatcher.run({deviceId: "coordinator-work", priority: "command"}, () => new Promise<void>((resolve) => { release = resolve; }));
+    const engine = new DeviceCommandEngine({port, storeFile: path.join(root, "commands.json")});
+    await engine.start();
+
+    const first = await engine.submit(ieeeAddress, {brightness: 10}, 1_000);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = await engine.submit(ieeeAddress, {brightness: 20}, 1_000);
+
+    assert.equal(port.sent.length, 0, "submission must not wait for or bypass the occupied radio");
+    const superseded = await terminal(engine, first.id);
+    assert.equal(superseded.status, "superseded");
+    assert.equal(superseded.supersededBy, second.id);
+    release();
+    await blocked;
+    assert.equal((await terminal(engine, second.id)).status, "confirmed");
+    assert.deepEqual(port.sent, [20]);
   } finally {
     await rm(root, {recursive: true, force: true});
   }

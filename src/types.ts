@@ -173,7 +173,7 @@ export interface StateEvent {
   origin: StateOrigin;
 }
 
-export type CommandStatus = "queued" | "sending" | "observing" | "confirmed" | "unverifiable" | "inconclusive" | "failed" | "interrupted";
+export type CommandStatus = "queued" | "sending" | "observing" | "confirmed" | "unverifiable" | "inconclusive" | "failed" | "superseded" | "interrupted";
 export type ObservationMode = "readback" | "passive";
 
 export interface CommandPropertyResult {
@@ -201,6 +201,7 @@ export interface DeviceCommand {
   sendingAt?: string;
   sentAt?: string;
   completedAt?: string;
+  supersededBy?: string;
   error?: string;
   failure?: {code: string; phase: "send" | "read" | "observe"; retryable: boolean; detail: string};
 }

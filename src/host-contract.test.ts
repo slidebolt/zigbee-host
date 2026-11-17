@@ -30,6 +30,7 @@ test("only the canonical device command routes are documented and implemented", 
   const paths = Object.keys(OPENAPI_DOCUMENT.paths);
   assert.ok(paths.includes("/v1/snapshot"));
   assert.ok(paths.includes("/v1/events"));
+  assert.ok(paths.includes("/v1/dispatcher"));
   assert.ok(paths.includes("/v1/devices/{deviceId}/components/{componentId}/commands"));
   assert.ok(paths.includes("/v1/pairing/start"));
   assert.ok(!paths.includes("/v1/devices/{deviceId}/state"));

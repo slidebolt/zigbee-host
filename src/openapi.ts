@@ -24,6 +24,14 @@ export const OPENAPI_DOCUMENT = {
       responses: {"202": {description: "Command queued"}, "404": {$ref: "#/components/responses/problem"}},
     }},
     "/v1/commands/{commandId}": {get: {operationId: "getCommand", parameters: [{name: "commandId", in: "path", required: true, schema: {type: "string"}}], responses: {"200": {description: "Command status"}}}},
+    "/v1/dispatcher": {
+      get: {operationId: "getDispatcher", responses: {"200": {description: "Radio dispatcher status"}}},
+      patch: {
+        operationId: "configureDispatcher",
+        requestBody: {required: true, content: {"application/json": {schema: {type: "object", required: ["maxInFlight"], properties: {maxInFlight: {type: "integer", minimum: 1, maximum: 16}, maxBackgroundInFlight: {type: "integer", minimum: 0, maximum: 16}}}}}},
+        responses: {"200": {description: "Updated radio dispatcher status"}, "400": {$ref: "#/components/responses/problem"}},
+      },
+    },
     "/v1/pairing": {get: {operationId: "getPairing", responses: {"200": {description: "Pairing status"}}}},
     "/v1/pairing/config": {patch: {operationId: "configurePairing", responses: {"200": {description: "Pairing configuration"}}}},
     "/v1/pairing/start": {post: {operationId: "startPairing", responses: {"202": {description: "Pairing started"}}}},
