@@ -5,6 +5,7 @@ import type {CoordinatorConnection, CoordinatorEvent} from "./coordinator-connec
 import {flattenExposes} from "./device-utils.js";
 import {StateStore, type DeviceState, type DeviceStateSnapshot} from "./state-store.js";
 import {ReachabilityTracker} from "./reachability.js";
+import {NetworkObservationStore} from "./network-observations.js";
 import {OperationDispatcher, OperationSupersededError, parseDispatcherOptions, type DispatcherStatus} from "./operation-dispatcher.js";
 import type {
   DeviceInfo,
@@ -21,6 +22,7 @@ const ACCESS_GET = 0b100;
 export interface ZigbeeServiceOptions {
   connection: CoordinatorConnection;
   stateFile: string;
+  networkObservationsFile?: string;
   output?: (event: string, data: unknown) => void;
   /** Maximum physical reads/writes allowed across different devices. */
   maxInFlight?: number;
@@ -63,11 +65,15 @@ export class ZigbeeService {
   }>();
   readonly #stateSubscribers = new Set<(event: StateEvent) => void>();
   readonly #reachability = new ReachabilityTracker();
+  readonly #network?: NetworkObservationStore;
   readonly #dispatcher: OperationDispatcher;
+  #lastTopologyRefresh = 0;
+  #topologyRefresh?: Promise<void>;
 
   constructor(options: ZigbeeServiceOptions) {
     this.#connection = options.connection;
     this.#state = new StateStore(options.stateFile);
+    if (options.networkObservationsFile) this.#network = new NetworkObservationStore(options.networkObservationsFile);
     this.#output = options.output ?? ((event, data) => console.log(JSON.stringify({event, data})));
     const configured = parseDispatcherOptions();
     this.#dispatcher = new OperationDispatcher({
@@ -81,16 +87,19 @@ export class ZigbeeService {
     if (this.#started) return;
     if (!this.#connection.connected) throw new Error("Device runtime cannot start before the coordinator connection");
     await this.#state.load();
+    await this.#network?.load();
     this.#unsubscribe = this.#connection.subscribe((event) => this.#handleCoordinatorEvent(event));
     this.#started = true;
     for (const device of this.#connection.devices((candidate) => candidate.type !== "Coordinator")) {
       this.#reachability.ensure(device.ieeeAddr);
+      await this.#network?.observeAddress(device.ieeeAddr, this.#role(device.type), device.networkAddress);
       const definition = await this.#resolveDefinition(device);
       await this.#callOnEvent(device, "start");
       if (definition?.configure && device.meta.configured !== definition.version) {
         await this.#configure(device).catch((error) => this.#eventError("configure", error));
       }
     }
+    void this.refreshNetworkDiagnostics().catch((error) => this.#eventError("network_diagnostics", error));
   }
 
   async stop(): Promise<void> {
@@ -200,6 +209,7 @@ export class ZigbeeService {
         } : undefined,
         exposes: definition ? flattenExposes(definition, device) : [],
         reachability: this.#reachability.get(device.ieeeAddr) ?? {status: "unknown"},
+        network: this.#network?.get(device.ieeeAddr),
       });
     }
     return result;
@@ -222,7 +232,45 @@ export class ZigbeeService {
       },
       exposes: flattenExposes(definition, device),
       reachability: this.#reachability.get(device.ieeeAddr) ?? {status: "unknown"},
+      network: this.#network?.get(device.ieeeAddr),
     };
+  }
+
+  async refreshNetworkDiagnostics(force = false): Promise<void> {
+    if (!force && Date.now() - this.#lastTopologyRefresh < 60_000) return;
+    if (this.#topologyRefresh) return this.#topologyRefresh;
+    this.#topologyRefresh = this.#scanTopology().finally(() => { this.#topologyRefresh = undefined; });
+    return this.#topologyRefresh;
+  }
+
+  async #scanTopology(): Promise<void> {
+    this.#lastTopologyRefresh = Date.now();
+    const nodes = this.#connection.devices();
+    const byAddress = new Map(nodes.map((device) => [device.networkAddress, device]));
+    const parentCandidates = new Map<string, Array<{parentId: string; depth: number; linkQuality: number}>>();
+    for (const parent of nodes.filter((device) => device.type === "Coordinator" || device.type === "Router")) {
+      try {
+        const table = await parent.lqi();
+        for (const entry of table) {
+          if (entry.relationship !== 1) continue;
+          const child = byAddress.get(entry.nwkAddress);
+          if (!child) continue;
+          const candidates = parentCandidates.get(child.ieeeAddr) ?? [];
+          candidates.push({parentId: parent.ieeeAddr, depth: entry.depth, linkQuality: entry.lqi});
+          parentCandidates.set(child.ieeeAddr, candidates);
+        }
+      } catch (error) {
+        if (parent.type !== "Coordinator") await this.#network?.observeTopology(parent.ieeeAddr, {topologyError: error instanceof Error ? error.message : String(error)});
+      }
+    }
+    for (const node of nodes.filter((device) => device.type !== "Coordinator")) {
+      const candidates = parentCandidates.get(node.ieeeAddr) ?? [];
+      const patch = candidates.length === 1
+        ? {parentId: candidates[0]!.parentId, relationship: "child", depth: candidates[0]!.depth, parentLinkQuality: candidates[0]!.linkQuality, topologyError: undefined}
+        : {parentId: undefined, relationship: undefined, depth: undefined, topologyError: candidates.length > 1 ? "multiple_parent_candidates" : "parent_not_observed"};
+      await this.#network?.observeTopology(node.ieeeAddr, patch);
+    }
+    this.#output("network_diagnostics", {refreshedAt: new Date().toISOString(), devices: await this.listDevices()});
   }
 
   async set(selector: string, property: string, value: unknown, endpointName?: string, scheduling: SetSchedulingOptions = {}): Promise<SetResult> {
@@ -252,6 +300,7 @@ export class ZigbeeService {
         return converted;
       });
       this.#markReachable(device.ieeeAddr);
+      void this.#network?.observeOutboundSuccess(device.ieeeAddr);
     } catch (error) {
       if (error instanceof OperationSupersededError) {
         this.#output("zigbee_service.set.superseded", {...context, value, operationId: scheduling.operationId, supersededBy: error.supersededBy, durationMs: Date.now() - started});
@@ -421,12 +470,16 @@ export class ZigbeeService {
 
   async #handleMessage(data: Events.MessagePayload): Promise<void> {
     const started = Date.now();
+    const network = await this.#network?.observeInbound(data.device.ieeeAddr, this.#role(data.device.type), data.device.networkAddress, data.linkquality);
+    this.#markInbound(data.device.ieeeAddr);
+    if (network) this.#output("device_network_observation", {deviceId: data.device.ieeeAddr, network});
     this.#output("zigbee_service.message.received", {
       device: data.device.ieeeAddr,
       modelID: data.device.modelID,
       cluster: data.cluster,
       type: data.type,
       endpoint: data.endpoint?.ID,
+      linkQuality: data.linkquality,
     });
     const definition = await this.#resolveDefinition(data.device);
     if (!definition) return;
@@ -528,6 +581,7 @@ export class ZigbeeService {
     if (event.type === "deviceJoined") {
       const {device} = event.data;
       this.#output("device_joined", {ieeeAddress: device.ieeeAddr, networkAddress: device.networkAddress});
+      void this.#network?.observeAddress(device.ieeeAddr, this.#role(device.type), device.networkAddress);
       void this.#callOnEvent(device, "deviceJoined").catch((error) => this.#eventError("deviceJoined", error));
     } else if (event.type === "deviceInterview") {
       const {device, status} = event.data;
@@ -545,10 +599,14 @@ export class ZigbeeService {
       }
     } else if (event.type === "deviceAnnounce") {
       const {device} = event.data;
-      this.#markReachable(device.ieeeAddr);
+      this.#markInbound(device.ieeeAddr);
+      void this.#network?.observeInbound(device.ieeeAddr, this.#role(device.type), device.networkAddress, device.linkquality);
+      void this.refreshNetworkDiagnostics().catch((error) => this.#eventError("network_diagnostics", error));
       void this.#callOnEvent(device, "deviceAnnounce").catch((error) => this.#eventError("deviceAnnounce", error));
     } else if (event.type === "deviceNetworkAddressChanged") {
       const {device} = event.data;
+      void this.#network?.observeAddress(device.ieeeAddr, this.#role(device.type), device.networkAddress);
+      void this.refreshNetworkDiagnostics().catch((error) => this.#eventError("network_diagnostics", error));
       void this.#callOnEvent(device, "deviceNetworkAddressChanged").catch((error) => this.#eventError("deviceNetworkAddressChanged", error));
     } else if (event.type === "deviceLeave") {
       const {ieeeAddr} = event.data;
@@ -573,15 +631,29 @@ export class ZigbeeService {
     if (changed) this.#output("device_reachability", {deviceId: ieeeAddress, reachability: record});
   }
 
+  #markInbound(ieeeAddress: string): void {
+    const {record, changed} = this.#reachability.markInbound(ieeeAddress);
+    if (changed) this.#output("device_reachability", {deviceId: ieeeAddress, reachability: record});
+  }
+
   #operationError(ieeeAddress: string, phase: "send" | "read", error: unknown): ZigbeeOperationError {
     const detail = error instanceof Error ? error.message : String(error);
     const code = detail.includes("Delivery failed") ? "device_unreachable" : detail.includes("Coordinator connection is not open") ? "coordinator_disconnected" : /timed? out|timeout/i.test(detail) ? "transport_timeout" : "zigbee_operation_failed";
     if (code === "device_unreachable" || code === "transport_timeout") {
       const at = new Date().toISOString();
       const {record, changed} = this.#reachability.markUnreachable(ieeeAddress, code, {at, code, phase, detail});
+      void this.#network?.observeFailure(ieeeAddress, {at, code, phase, detail});
       if (changed) this.#output("device_reachability", {deviceId: ieeeAddress, reachability: record});
+      void this.refreshNetworkDiagnostics().catch((scanError) => this.#eventError("network_diagnostics", scanError));
     }
     return new ZigbeeOperationError(code, phase, code !== "zigbee_operation_failed", detail, {cause: error});
+  }
+
+  #role(type: string): "coordinator" | "router" | "end_device" | "unknown" {
+    if (type === "Coordinator") return "coordinator";
+    if (type === "Router") return "router";
+    if (type === "EndDevice") return "end_device";
+    return "unknown";
   }
 
   #notifyDevice(device: DeviceInfo): void {

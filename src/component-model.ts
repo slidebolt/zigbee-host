@@ -92,7 +92,8 @@ export function normalizeDevice(device: DeviceInfo, state: Record<string, unknow
     kind: device.type.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase(),
     interview: device.interviewState.toLowerCase(),
     reachability: device.reachability ?? {status: "unknown"},
-    available: device.reachability?.status === "reachable",
+    available: device.reachability?.status === "reachable" || device.reachability?.status === "degraded",
+    ...(device.network ? {network: device.network} : {}),
     components: normalizeComponents(device, state),
   };
 }

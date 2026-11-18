@@ -40,7 +40,7 @@ export class ZigbeeRuntimeManager implements ManagedZigbeeRuntime {
       if (options.output) options.output(event, data);
       else console.log(JSON.stringify({event, data}));
     };
-    this.gateway = new ZigbeeService({connection: this.connection, stateFile: paths.state, output});
+    this.gateway = new ZigbeeService({connection: this.connection, stateFile: paths.state, networkObservationsFile: paths.networkObservations, output});
     this.commands = new DeviceCommandEngine({port: this.gateway, storeFile: paths.commands, output: options.output});
     this.#warmer = new ZigbeeWarmLoop({
       port: {

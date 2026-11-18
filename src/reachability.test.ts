@@ -31,3 +31,14 @@ test("after a coordinator disconnect the next success is a change again", () => 
   assert.equal(tracker.get("0x1")?.status, "unknown");
   assert.equal(tracker.markReachable("0x1").changed, true);
 });
+
+test("inbound traffic after an outbound failure is degraded, not unavailable", () => {
+  const tracker = new ReachabilityTracker();
+  tracker.markReachable("0x1", "2026-11-17T19:00:00Z");
+  tracker.markUnreachable("0x1", "device_unreachable", {...failure, at: "2026-11-17T19:01:00Z"});
+  const inbound = tracker.markInbound("0x1", "2026-11-17T19:02:00Z");
+  assert.equal(inbound.record.status, "degraded");
+  assert.equal(inbound.record.lastSeen, "2026-11-17T19:02:00Z");
+  assert.equal(inbound.record.lastFailure?.code, "device_unreachable");
+  assert.equal(tracker.markReachable("0x1", "2026-11-17T19:03:00Z").record.status, "reachable");
+});

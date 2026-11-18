@@ -228,7 +228,12 @@ export class ZigbeeHost {
         this.#hub?.emit(type, data, requestId);
         void this.#publishIntegrationEvent(type, data, requestId, manager);
         if (type === "devices" && Array.isArray(data)) void this.#catalog?.replace(data as DeviceInfo[]).catch(() => undefined);
+        if (type === "network_diagnostics") {
+          const devices = (data as {devices?: unknown})?.devices;
+          if (Array.isArray(devices)) void this.#catalog?.replace(devices as DeviceInfo[]).catch(() => undefined);
+        }
         if (type === "device_reachability") void manager.gateway.listDevices().then((devices) => this.#catalog?.replace(devices)).catch(() => undefined);
+        if (type === "device_network_observation") void manager.gateway.listDevices().then((devices) => this.#catalog?.replace(devices)).catch(() => undefined);
         if (type === "adapter_disconnected") this.#handleAdapterDisconnected(manager);
     }, port);
     return manager;
@@ -268,8 +273,24 @@ export class ZigbeeHost {
       }
       return;
     }
+    if (type === "network_diagnostics") {
+      const devices = Array.isArray(record.devices) ? record.devices as DeviceInfo[] : [];
+      for (const device of devices) {
+        const state = manager.gateway.getStateSnapshotById(device.ieeeAddress).reported;
+        this.#hub?.emit("device.upserted", normalizeDevice(device, state), requestId, "device");
+      }
+      return;
+    }
     if (type === "device_reachability") {
       this.#hub?.emit("device.availability_changed", {deviceId: record.deviceId, reachability: record.reachability}, requestId, "device");
+      return;
+    }
+    if (type === "device_network_observation") {
+      const deviceId = String(record.deviceId ?? "");
+      if (!deviceId) return;
+      const device = await manager.gateway.getDevice(deviceId);
+      const state = manager.gateway.getStateSnapshotById(deviceId).reported;
+      this.#hub?.emit("device.upserted", normalizeDevice(device, state), requestId, "device");
       return;
     }
     if (type === "device_left") {
@@ -401,6 +422,10 @@ export class ZigbeeHost {
         const dispatcher = this.#manager!.gateway.configureDispatcher(maxInFlight, maxBackgroundInFlight);
         this.#hub?.emit("dispatcher.configured", dispatcher, requestId, "command");
         json(response, 200, {dispatcher, requestId});
+      } else if (method === "POST" && url.pathname === "/v1/network/refresh") {
+        this.#requireAvailable();
+        await this.#manager!.gateway.refreshNetworkDiagnostics(true);
+        json(response, 202, {accepted: true, requestId});
       } else if (method === "GET" && url.pathname.startsWith("/v1/commands/")) {
         const command = (this.#manager?.commands ?? this.#offlineCommands!).get(url.pathname.slice("/v1/commands/".length));
         if (!command) throw new HttpError(404, "command_not_found", "command not found");

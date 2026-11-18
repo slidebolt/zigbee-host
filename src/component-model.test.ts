@@ -29,6 +29,17 @@ test("normalization groups light features and separates sensors", () => {
   assert.deepEqual(commandValues(light, "set_brightness", {brightness: 12}), {brightness: 12});
 });
 
+test("normalization preserves generic network diagnostics and treats degraded devices as present", () => {
+  const source: DeviceInfo = {
+    ...bulb,
+    reachability: {status: "degraded", reason: "device_unreachable"},
+    network: {role: "router", address: 26510, previousAddress: 25760, parentId: "0x00124b0000000002", linkQuality: 147},
+  };
+  const normalized = normalizeDevice(source);
+  assert.equal(normalized.available, true);
+  assert.deepEqual(normalized.network, source.network);
+});
+
 test("generic writable binary exposes use their actual property", () => {
   const device = normalizeDevice({...bulb, exposes: [{property: "child_lock", type: "binary", access: 3, values: ["LOCK", "UNLOCK"]}]}, {child_lock: "UNLOCK"});
   const component = device.components[0]!;

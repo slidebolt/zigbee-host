@@ -40,3 +40,22 @@ startup with `ZIGBEE_MAX_IN_FLIGHT` (1–16) and
 `ZIGBEE_MAX_BACKGROUND_IN_FLIGHT` (0–the total). Inspect or tune a running host
 through authenticated `GET /v1/dispatcher` and `PATCH /v1/dispatcher`; the
 effective dispatcher status is also included in `GET /v1/health`.
+
+## Network observations
+
+Each device in the snapshot carries provider-neutral reachability and an
+optional `network` observation. The observation retains the current and prior
+network address, packet LQI (0–255), inbound and outbound timestamps, the last
+failure, and parent/depth evidence from neighbor-table scans. Incoming packets
+are recorded before converter selection, so even an unsupported OTA frame is
+valid evidence that the device can still transmit.
+
+Reachability distinguishes `reachable`, `degraded`, `unreachable`, and
+`unknown`. A device that continues sending after an outbound delivery failure
+is degraded rather than falsely reported as absent. Observations are persisted
+in `/data/network-observations.json`; that file contains no network key or host
+token.
+
+The authenticated `POST /v1/network/refresh` operation asks the host to refresh
+neighbor-table evidence. It is an internal plugin-host operation; Slidebolt
+clients use the generic coordinator button entity instead.

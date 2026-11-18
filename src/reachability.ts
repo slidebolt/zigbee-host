@@ -26,6 +26,20 @@ export class ReachabilityTracker {
     return {record, changed};
   }
 
+  markInbound(ieeeAddress: string, now = new Date().toISOString()): {record: DeviceReachability; changed: boolean} {
+    const previous = this.#records.get(ieeeAddress);
+    const status = previous?.lastFailure && (!previous.lastSuccess || previous.lastFailure.at > previous.lastSuccess) ? "degraded" : "reachable";
+    const changed = previous?.status !== status;
+    const record: DeviceReachability = {
+      ...previous,
+      status,
+      lastSeen: now,
+      ...(status === "reachable" ? {lastSuccess: now, reason: undefined} : {}),
+    };
+    this.#records.set(ieeeAddress, record);
+    return {record, changed};
+  }
+
   markUnreachable(ieeeAddress: string, reason: string, failure: ReachabilityFailure): {record: DeviceReachability; changed: boolean} {
     const previous = this.#records.get(ieeeAddress);
     const changed = previous?.status !== "unreachable";

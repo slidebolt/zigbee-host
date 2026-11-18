@@ -18,6 +18,7 @@ export interface RuntimePaths {
   commands: string;
   adapterIdentity: string;
   deviceCatalog: string;
+  networkObservations: string;
 }
 
 export interface DeviceInfo {
@@ -35,14 +36,33 @@ export interface DeviceInfo {
   };
   exposes: ExposedProperty[];
   reachability?: DeviceReachability;
+  network?: DeviceNetworkObservation;
 }
 
 export interface DeviceReachability {
-  status: "unknown" | "reachable" | "unreachable";
+  status: "unknown" | "reachable" | "degraded" | "unreachable";
   lastSeen?: string;
   lastSuccess?: string;
   reason?: string;
   lastFailure?: {at: string; code: string; phase: "send" | "read" | "observe"; detail: string};
+}
+
+export interface DeviceNetworkObservation {
+  role: "coordinator" | "router" | "end_device" | "unknown";
+  address: number;
+  previousAddress?: number;
+  addressChangedAt?: string;
+  parentId?: string;
+  relationship?: string;
+  depth?: number;
+  linkQuality?: number;
+  parentLinkQuality?: number;
+  linkQualityObservedAt?: string;
+  topologyObservedAt?: string;
+  lastInboundAt?: string;
+  lastOutboundSuccessAt?: string;
+  lastFailure?: DeviceReachability["lastFailure"];
+  topologyError?: string;
 }
 
 export interface ExposedProperty {
@@ -86,6 +106,7 @@ export interface HostDevice extends ApiDeviceSummary {
   description?: string;
   available: boolean;
   components: HostComponent[];
+  network?: DeviceNetworkObservation;
 }
 
 export interface DeviceCapability {

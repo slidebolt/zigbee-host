@@ -17,6 +17,7 @@ export function runtimePaths(root = path.resolve(process.env.ZIGBEE_DATA_DIR ?? 
     commands: path.join(root, "commands.json"),
     adapterIdentity: path.join(root, "adapter.json"),
     deviceCatalog: path.join(root, "device-catalog.json"),
+    networkObservations: path.join(root, "network-observations.json"),
   };
 }
 
